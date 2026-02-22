@@ -1,0 +1,428 @@
+# 07 - 会话与编辑流程
+
+## 会话生命周期
+
+```
+用户连接 → 创建/恢复 Session → 对话循环 → 断开(保留 Session)
+```
+
+### Session 结构
+
+```go
+type Session struct {
+    ID                string          `json:"id"`
+    UserID            string          `json:"userId"`
+    ActiveDashboardID string          `json:"activeDashboardId,omitempty"`
+    DashboardIDs      []string        `json:"dashboardIds"`      // 所有看板
+    Messages          []eino.Message  `json:"messages"`          // 对话历史
+    CreatedAt         time.Time       `json:"createdAt"`
+    LastActiveAt      time.Time       `json:"lastActiveAt"`
+}
+```
+
+## 完整对话流程
+
+### 场景 1：首次生成看板
+
+```
+用户: "帮我做一个黄金和白银的对比看板，要K线对比、相关性热力图和最新舆情"
+
+→ Session Manager 构建 messages:
+  [system] System Prompt + "当前无活跃看板"
+  [user] "帮我做一个黄金和白银的对比看板..."
+
+→ Eino Agent 处理:
+  
+  Step 1 - Agent 思考:
+    "用户需要三个面板：黄金白银K线对比、相关性热力图、舆情。
+     需要搜索行情数据源和舆情数据源。"
+  
+  → WS 推送: { type: 'agent:thinking', payload: { message: '分析需求中...' } }
+  
+  Step 2 - Agent 调用 search:
+    search({
+      code: `
+        var results = [];
+        spec.sources.forEach(function(src) {
+          src.methods.forEach(function(m) {
+            if (m.name === 'getKline' || m.name === 'getDaily' ||
+                m.name === 'searchTweets' || m.name === 'getSentimentTimeline') {
+              results.push({ source: src.name, method: m.name, description: m.description, params: m.params });
+            }
+          });
+        });
+        results;
+      `
+    })
+    
+  → 返回: [
+      { source: "market", method: "getKline", ... },
+      { source: "market", method: "getDaily", ... },
+      { source: "social", method: "searchTweets", ... },
+      { source: "social", method: "getSentimentTimeline", ... }
+    ]
+  
+  → WS 推送: { type: 'agent:executing', payload: { tool: 'search' } }
+  
+  Step 3 - Agent 调用 execute:
+    execute({
+      code: `
+        (function() {
+          var results = utils.parallel(
+            function() { return sdk.market.getKline({ symbol: 'XAUUSD', timeframe: '1D', limit: 120 }); },
+            function() { return sdk.market.getKline({ symbol: 'XAGUSD', timeframe: '1D', limit: 120 }); },
+            function() { return sdk.market.getDaily({ symbol: 'XAUUSD', limit: 252 }); },
+            function() { return sdk.market.getDaily({ symbol: 'XAGUSD', limit: 252 }); },
+            function() { return sdk.social.searchTweets({ query: 'gold silver', limit: 50, sentiment: true }); }
+          );
+          
+          var goldKline = results[0];
+          var silverKline = results[1];
+          var goldDaily = results[2];
+          var silverDaily = results[3];
+          var tweets = results[4];
+          
+          // 计算相关性
+          var goldCloses = goldDaily.map(function(d) { return d.close; });
+          var silverCloses = silverDaily.map(function(d) { return d.close; });
+          var corrMatrix = utils.computeCorrelationMatrix(
+            [goldCloses, silverCloses],
+            ['XAUUSD', 'XAGUSD']
+          );
+          
+          return {
+            title: '黄金 vs 白银 对比看板',
+            layout: { mode: 'grid', columns: 2, gap: 8 },
+            panels: [
+              {
+                id: 'gold-kline',
+                title: '黄金日线 XAUUSD',
+                type: 'candlestick',
+                renderer: 'lightweight-charts',
+                position: { col: 0, row: 0 },
+                data: goldKline,
+                indicators: [{ type: 'MA', periods: [20, 60] }],
+                dataSource: { source: 'market', method: 'getKline', params: { symbol: 'XAUUSD', timeframe: '1D', limit: 120 } }
+              },
+              {
+                id: 'silver-kline',
+                title: '白银日线 XAGUSD',
+                type: 'candlestick',
+                renderer: 'lightweight-charts',
+                position: { col: 1, row: 0 },
+                data: silverKline,
+                indicators: [{ type: 'MA', periods: [20, 60] }],
+                dataSource: { source: 'market', method: 'getKline', params: { symbol: 'XAGUSD', timeframe: '1D', limit: 120 } }
+              },
+              {
+                id: 'correlation',
+                title: '黄金白银相关性',
+                type: 'heatmap',
+                renderer: 'echarts',
+                position: { col: 0, row: 1 },
+                data: corrMatrix,
+                config: { colorScale: 'RdYlGn' }
+              },
+              {
+                id: 'precious-metals-feed',
+                title: '贵金属舆情',
+                type: 'feed',
+                renderer: 'custom',
+                position: { col: 1, row: 1 },
+                data: { items: tweets },
+                config: { showSentiment: true, sortBy: 'time' },
+                dataSource: { source: 'social', method: 'searchTweets', params: { query: 'gold silver', limit: 50 } }
+              }
+            ]
+          };
+        })()
+      `
+    })
+
+  → Sandbox 执行 → 返回 DashboardState
+  → State Store 持久化
+  → WS 推送: { type: 'dashboard:created', payload: { dashboardId: 'db_xxx', state: {...} } }
+  → 前端渲染四面板看板
+  
+  Step 4 - Agent 回复:
+    "已为您生成「黄金 vs 白银 对比看板」，包含：
+     - 黄金日线K线（含MA20/60）
+     - 白银日线K线（含MA20/60）
+     - 黄金白银相关性热力图
+     - 贵金属推特舆情（含情绪分析）
+     
+     需要调整可以随时说。"
+```
+
+### 场景 2：编辑看板
+
+```
+用户: "把K线都换成周线，相关性那个加上标普和美元指数"
+
+→ Session Manager 构建 messages:
+  [system] System Prompt + "当前看板: 黄金 vs 白银 对比看板 (db_xxx), panels: gold-kline, silver-kline, correlation, precious-metals-feed"
+  [history] ... 之前的对话 ...
+  [user] "把K线都换成周线，相关性那个加上标普和美元指数"
+
+→ Eino Agent 处理:
+
+  Step 1 - Agent 调用 get_state (summary):
+    get_state({ detail_level: "summary" })
+    
+  → 返回当前看板摘要
+
+  Step 2 - Agent 调用 mutate:
+    mutate({
+      code: `
+        (function(state) {
+          // 1. K线换周线
+          var results = utils.parallel(
+            function() { return sdk.market.getKline({ symbol: 'XAUUSD', timeframe: '1W', limit: 120 }); },
+            function() { return sdk.market.getKline({ symbol: 'XAGUSD', timeframe: '1W', limit: 120 }); },
+            function() { return sdk.market.getDaily({ symbol: 'XAUUSD', limit: 252 }); },
+            function() { return sdk.market.getDaily({ symbol: 'XAGUSD', limit: 252 }); },
+            function() { return sdk.market.getDaily({ symbol: 'SPX', limit: 252 }); },
+            function() { return sdk.market.getDaily({ symbol: 'DXY', limit: 252 }); }
+          );
+          
+          // 更新K线数据
+          var goldPanel = state.panels.find(function(p) { return p.id === 'gold-kline'; });
+          goldPanel.data = results[0];
+          goldPanel.title = '黄金周线 XAUUSD';
+          goldPanel.dataSource.params.timeframe = '1W';
+          
+          var silverPanel = state.panels.find(function(p) { return p.id === 'silver-kline'; });
+          silverPanel.data = results[1];
+          silverPanel.title = '白银周线 XAGUSD';
+          silverPanel.dataSource.params.timeframe = '1W';
+          
+          // 2. 更新相关性矩阵：加入 SPX 和 DXY
+          var allDaily = [results[2], results[3], results[4], results[5]];
+          var allCloses = allDaily.map(function(d) { return d.map(function(p) { return p.close; }); });
+          var corrMatrix = utils.computeCorrelationMatrix(
+            allCloses,
+            ['XAUUSD', 'XAGUSD', 'SPX', 'DXY']
+          );
+          
+          var corrPanel = state.panels.find(function(p) { return p.id === 'correlation'; });
+          corrPanel.data = corrMatrix;
+          corrPanel.title = '多资产相关性矩阵';
+          
+          // 调整布局：相关性面板加宽
+          corrPanel.position = { col: 0, row: 1, colSpan: 2 };
+          state.panels.find(function(p) { return p.id === 'precious-metals-feed'; }).position = { col: 0, row: 2, colSpan: 2 };
+          
+          return state;
+        })
+      `
+    })
+
+  → Sandbox 执行 → 返回新 state
+  → Diff 计算: updatedPanels: [gold-kline, silver-kline, correlation, precious-metals-feed(position)]
+  → State Store 更新
+  → WS 推送: { type: 'dashboard:updated', payload: { dashboardId: 'db_xxx', diff: {...} } }
+  → 前端局部刷新
+  
+  Step 3 - Agent 回复:
+    "已更新：
+     - K线已切换为周线
+     - 相关性矩阵加入了标普500和美元指数
+     - 布局已调整，相关性面板扩展为全宽"
+```
+
+### 场景 3：自由发挥的需求
+
+```
+用户: "帮我加一个面板，显示最近一年黄金和比特币的走势叠加图，都标准化到0-100"
+
+→ Agent 调用 mutate:
+  mutate({
+    code: `
+      (function(state) {
+        var results = utils.parallel(
+          function() { return sdk.market.getDaily({ symbol: 'XAUUSD', limit: 252 }); },
+          function() { return sdk.market.getDaily({ symbol: 'BTCUSD', limit: 252 }); }
+        );
+        
+        var goldNorm = utils.normalize(results[0].map(function(d) { return d.close; }));
+        var btcNorm = utils.normalize(results[1].map(function(d) { return d.close; }));
+        var times = results[0].map(function(d) { return d.date; });
+        
+        // 转换为 0-100 范围
+        var goldScaled = goldNorm.map(function(v) { return v * 100; });
+        var btcScaled = btcNorm.map(function(v) { return v * 100; });
+        
+        state.panels.push({
+          id: 'gold-btc-overlay',
+          title: '黄金 vs 比特币 标准化走势 (0-100)',
+          type: 'line',
+          renderer: 'lightweight-charts',
+          data: {
+            series: [
+              { name: '黄金', data: times.map(function(t, i) { return { time: t, value: goldScaled[i] }; }) },
+              { name: '比特币', data: times.map(function(t, i) { return { time: t, value: btcScaled[i] }; }) }
+            ]
+          },
+          config: { multiSeries: true }
+        });
+        
+        return state;
+      })
+    `
+  })
+```
+
+### 场景 4：复杂分析需求
+
+```
+用户: "帮我做一个宏观仪表盘，要看美国CPI趋势、10Y-2Y利差、非农就业，加上下周的经济日历"
+
+→ Agent 调用 search (找到 macro 数据源)
+→ Agent 调用 execute:
+  execute({
+    code: `
+      (function() {
+        var results = utils.parallel(
+          function() { return sdk.macro.getIndicator({ indicator: 'CPI', country: 'US', limit: 24 }); },
+          function() { return sdk.macro.getInterestRates({ country: 'US', types: ['10Y', '2Y', 'spread_10Y_2Y'] }); },
+          function() { return sdk.macro.getIndicator({ indicator: 'UNEMPLOYMENT', country: 'US', limit: 24 }); },
+          function() { return sdk.macro.getEconomicCalendar({ days: 7, importance: 'high', country: 'US' }); }
+        );
+        
+        return {
+          title: '美国宏观经济仪表盘',
+          layout: { mode: 'grid', columns: 2, gap: 8 },
+          panels: [
+            {
+              id: 'us-cpi',
+              title: '美国 CPI 同比',
+              type: 'bar',
+              renderer: 'echarts',
+              position: { col: 0, row: 0 },
+              data: {
+                categories: results[0].map(function(d) { return d.date; }),
+                series: [{ name: 'CPI YoY%', values: results[0].map(function(d) { return d.value; }) }]
+              },
+              config: { colorByValue: true, threshold: 2.0 },
+              dataSource: { source: 'macro', method: 'getIndicator', params: { indicator: 'CPI', country: 'US' } }
+            },
+            {
+              id: 'yield-spread',
+              title: '10Y-2Y 利差',
+              type: 'area',
+              renderer: 'lightweight-charts',
+              position: { col: 1, row: 0 },
+              data: results[1].spread_10Y_2Y.map(function(d) { return { time: d.date, value: d.value }; }),
+              config: { 
+                zeroLine: true,
+                positiveColor: 'rgba(38,166,154,0.4)',
+                negativeColor: 'rgba(239,83,80,0.4)'
+              },
+              dataSource: { source: 'macro', method: 'getInterestRates', params: { country: 'US', types: ['spread_10Y_2Y'] } }
+            },
+            {
+              id: 'unemployment',
+              title: '失业率',
+              type: 'line',
+              renderer: 'lightweight-charts',
+              position: { col: 0, row: 1 },
+              data: results[2].map(function(d) { return { time: d.date, value: d.value }; }),
+              dataSource: { source: 'macro', method: 'getIndicator', params: { indicator: 'UNEMPLOYMENT', country: 'US' } }
+            },
+            {
+              id: 'econ-calendar',
+              title: '本周经济日历',
+              type: 'table',
+              renderer: 'custom',
+              position: { col: 1, row: 1 },
+              data: {
+                columns: [
+                  { key: 'datetime', title: '时间', type: 'datetime' },
+                  { key: 'event', title: '事件', type: 'string' },
+                  { key: 'importance', title: '重要性', type: 'badge' },
+                  { key: 'forecast', title: '预期', type: 'number' },
+                  { key: 'previous', title: '前值', type: 'number' }
+                ],
+                rows: results[3]
+              },
+              dataSource: { source: 'macro', method: 'getEconomicCalendar', params: { days: 7, importance: 'high' } }
+            }
+          ]
+        };
+      })()
+    `
+  })
+```
+
+## 错误恢复
+
+### Agent 代码执行失败
+
+```
+用户: "帮我加一个比特币链上MVRV指标"
+
+→ Agent 调用 execute，但 onchain SDK 返回错误
+
+→ Sandbox 捕获错误，返回给 Agent:
+  { error: "sdk.onchain.getMetrics: API rate limit exceeded, retry after 60s" }
+
+→ Agent 处理错误，回复用户:
+  "链上数据接口暂时限流了，大约1分钟后可以重试。要我稍后再试，还是先用其他数据？"
+```
+
+### Agent 生成了无效 State
+
+```
+→ Sandbox 执行成功，但返回的 state 缺少必需字段
+
+→ Validator 捕获:
+  { error: "invalid DashboardState: panel[0] missing 'id' field" }
+
+→ 返回给 Agent，Agent 修正代码重试（最多 2 次）
+```
+
+## 上下文注入策略
+
+每轮对话自动在 system prompt 末尾附加当前看板上下文：
+
+```go
+func (s *Session) buildDashboardContext() string {
+    if s.ActiveDashboardID == "" {
+        return "\n\n[当前无活跃看板]"
+    }
+    
+    state, _ := s.stateStore.Get(s.ActiveDashboardID)
+    summary := state.ToSummary()
+    
+    var buf strings.Builder
+    buf.WriteString(fmt.Sprintf("\n\n[当前看板: \"%s\" (%s)]\n", state.Title, state.ID))
+    buf.WriteString(fmt.Sprintf("布局: %dx grid\n", state.Layout.Columns))
+    buf.WriteString("面板:\n")
+    for _, p := range summary.Panels {
+        buf.WriteString(fmt.Sprintf("  - %s: %s (%s, %s)", p.ID, p.Title, p.Type, p.Renderer))
+        if len(p.Indicators) > 0 {
+            buf.WriteString(fmt.Sprintf(" [%s]", strings.Join(p.Indicators, ", ")))
+        }
+        buf.WriteString("\n")
+    }
+    
+    if len(s.DashboardIDs) > 1 {
+        buf.WriteString(fmt.Sprintf("\n其他看板: %d 个\n", len(s.DashboardIDs)-1))
+    }
+    
+    return buf.String()
+}
+```
+
+输出示例：
+```
+[当前看板: "黄金 vs 白银 对比看板" (db_abc123)]
+布局: 2x grid
+面板:
+  - gold-kline: 黄金周线 XAUUSD (candlestick, lightweight-charts) [MA(20), MA(60)]
+  - silver-kline: 白银周线 XAGUSD (candlestick, lightweight-charts) [MA(20), MA(60)]
+  - correlation: 多资产相关性矩阵 (heatmap, echarts)
+  - precious-metals-feed: 贵金属舆情 (feed, custom)
+```
+
+这段上下文约 200-300 tokens，让 Agent 无需调用 get_state 就知道当前看板概况。
