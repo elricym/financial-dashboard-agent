@@ -1,18 +1,22 @@
 # 08 - 数据刷新与缓存
 
+## 核心概念
+
+**刷新 = 重新执行 panel.code。** 每个 panel 的 `code` 字段包含完整的数据获取逻辑，刷新时只需重新执行 code，无需 Agent 参与，无需单独存储 dataSource 参数。
+
 ## 刷新机制
 
 ### 三种刷新方式
 
 ```
-1. 手动刷新 — 用户点击 panel 上的刷新按钮
-2. 自动刷新 — panel 配置了 refreshInterval，后端定时推送
-3. 语音刷新 — 用户说"更新一下数据"，Agent 调用 mutate 重新拉取
+1. 手动刷新 — 用户点击 panel 上的刷新按钮 → 后端重新执行 panel.code
+2. 自动刷新 — panel 配置了 refreshInterval → 后端定时重新执行 panel.code
+3. 对话刷新 — 用户说"更新一下数据" → Agent 调用 mutate 修改 code（或后端直接重执行）
 ```
 
 ### 手动刷新
 
-前端直接调用 API，不经过 Agent：
+前端直接调用 API，不经过 Agent。后端重新执行 panel.code：
 
 ```typescript
 // 前端
@@ -22,6 +26,13 @@ async function refreshPanel(dashboardId: string, panelId: string) {
   });
   // 新数据通过 WebSocket 推送
 }
+
+// 刷新整个看板的所有 panel
+async function refreshDashboard(dashboardId: string) {
+  const res = await fetch(`/api/dashboard/${dashboardId}/refresh`, {
+    method: 'POST',
+  });
+}
 ```
 
 ```go
@@ -29,32 +40,33 @@ async function refreshPanel(dashboardId: string, panelId: string) {
 func (h *Handler) RefreshPanel(w http.ResponseWriter, r *http.Request) {
     dashboardID := chi.URLParam(r, "dashboardId")
     panelID := chi.URLParam(r, "panelId")
+    userID := getUserID(r)
     
-    state, _ := h.stateStore.Get(r.Context(), dashboardID)
+    state, _ := h.stateStore.Get(r.Context(), userID, dashboardID)
     panel := state.FindPanel(panelID)
     
-    if panel.DataSource == nil {
-        http.Error(w, "panel has no data source", 400)
+    if panel.Code == "" {
+        http.Error(w, "panel has no code", 400)
         return
     }
     
-    // 使用记录的 dataSource 重新拉取
-    newData, err := h.adapters.Call(r.Context(),
-        panel.DataSource.Source,
-        panel.DataSource.Method,
-        panel.DataSource.Params,
-    )
+    // 在沙箱中重新执行 panel.code
+    sandbox := h.sandboxPool.Get()
+    defer h.sandboxPool.Put(sandbox)
+    sandbox.Inject("sdk", h.cachedAdapters)
+    sandbox.Inject("utils", standardUtils)
+    
+    newData, err := sandbox.Execute(r.Context(), panel.Code)
     if err != nil {
         http.Error(w, err.Error(), 500)
         return
     }
     
-    // 更新 state
-    panel.Data = newData
+    // 更新 lastRefresh 时间
     panel.LastRefresh = timePtr(time.Now())
-    h.stateStore.Save(r.Context(), state)
+    h.stateStore.Save(r.Context(), userID, state)
     
-    // 推送增量更新
+    // 推送新数据到前端
     h.wsHub.Send(state.ID, WSMessage{
         Type: "panel:refreshed",
         Payload: map[string]any{
@@ -64,20 +76,47 @@ func (h *Handler) RefreshPanel(w http.ResponseWriter, r *http.Request) {
         },
     })
 }
+
+// RefreshDashboard 刷新整个看板
+func (h *Handler) RefreshDashboard(w http.ResponseWriter, r *http.Request) {
+    dashboardID := chi.URLParam(r, "dashboardId")
+    userID := getUserID(r)
+    
+    state, _ := h.stateStore.Get(r.Context(), userID, dashboardID)
+    
+    // 并行执行所有 panel.code
+    renderData, err := h.codeExecutor.ExecuteAllPanels(r.Context(), state)
+    if err != nil {
+        http.Error(w, err.Error(), 500)
+        return
+    }
+    
+    // 推送所有 panel 的新数据
+    for _, pd := range renderData {
+        h.wsHub.Send(state.ID, WSMessage{
+            Type: "panel:refreshed",
+            Payload: map[string]any{
+                "dashboardId": dashboardID,
+                "panelId":     pd.ID,
+                "data":        pd.Data,
+            },
+        })
+    }
+}
 ```
 
 ### 自动刷新
 
 ```go
 type RefreshScheduler struct {
-    stateStore *StateStore
-    adapters   *AdapterRegistry
-    wsHub      *WSHub
-    jobs       map[string]*time.Ticker // key: dashboardID:panelID
-    mu         sync.Mutex
+    stateStore  *FileStateStore
+    codeExec    *CodeExecutor
+    wsHub       *WSHub
+    jobs        map[string]*time.Ticker // key: userID:dashboardID:panelID
+    mu          sync.Mutex
 }
 
-func (s *RefreshScheduler) SchedulePanel(dashboardID string, panel *Panel) {
+func (s *RefreshScheduler) SchedulePanel(userID, dashboardID string, panel *Panel) {
     if panel.RefreshInterval == "" {
         return
     }
@@ -87,12 +126,11 @@ func (s *RefreshScheduler) SchedulePanel(dashboardID string, panel *Panel) {
         return // 最小 10 秒
     }
     
-    key := fmt.Sprintf("%s:%s", dashboardID, panel.ID)
+    key := fmt.Sprintf("%s:%s:%s", userID, dashboardID, panel.ID)
     
     s.mu.Lock()
     defer s.mu.Unlock()
     
-    // 取消旧的
     if old, exists := s.jobs[key]; exists {
         old.Stop()
     }
@@ -102,34 +140,35 @@ func (s *RefreshScheduler) SchedulePanel(dashboardID string, panel *Panel) {
     
     go func() {
         for range ticker.C {
-            s.refreshPanel(context.Background(), dashboardID, panel.ID)
+            s.refreshPanel(context.Background(), userID, dashboardID, panel.ID)
         }
     }()
 }
 
-func (s *RefreshScheduler) refreshPanel(ctx context.Context, dashboardID, panelID string) {
-    state, err := s.stateStore.Get(ctx, dashboardID)
+func (s *RefreshScheduler) refreshPanel(ctx context.Context, userID, dashboardID, panelID string) {
+    state, err := s.stateStore.Get(ctx, userID, dashboardID)
     if err != nil {
         return
     }
     
     panel := state.FindPanel(panelID)
-    if panel == nil || panel.DataSource == nil {
+    if panel == nil || panel.Code == "" {
         return
     }
     
-    newData, err := s.adapters.Call(ctx,
-        panel.DataSource.Source,
-        panel.DataSource.Method,
-        panel.DataSource.Params,
-    )
+    // 重新执行 panel.code
+    sandbox := s.codeExec.sandboxPool.Get()
+    defer s.codeExec.sandboxPool.Put(sandbox)
+    sandbox.Inject("sdk", s.codeExec.adapters)
+    sandbox.Inject("utils", standardUtils)
+    
+    newData, err := sandbox.Execute(ctx, panel.Code)
     if err != nil {
         return // 静默失败，下次重试
     }
     
-    panel.Data = newData
     panel.LastRefresh = timePtr(time.Now())
-    s.stateStore.Save(ctx, state)
+    s.stateStore.Save(ctx, userID, state)
     
     s.wsHub.Send(dashboardID, WSMessage{
         Type: "panel:refreshed",
@@ -142,20 +181,37 @@ func (s *RefreshScheduler) refreshPanel(ctx context.Context, dashboardID, panelI
 }
 ```
 
+## 为什么不需要单独的 dataSource 参数？
+
+旧设计中 `dataSource` 存储了 `{ source, method, params }`，刷新时通过这些参数重新调用 SDK。
+
+新设计中，`code` 字段本身就是完整的数据获取逻辑：
+
+```javascript
+// panel.code 包含了所有信息
+"const data = await sdk.market.getKline({ symbol: 'XAUUSD', timeframe: '1D', limit: 120 }); return data;"
+```
+
+- **code 是自包含的** — 不需要从外部传入参数
+- **code 可以包含复杂逻辑** — 多数据源组合、计算、转换
+- **dataSource 保留为可选元数据** — 仅用于 UI 展示"数据来源: market.getKline"
+
 ## 缓存策略
 
 ### 多层缓存
 
 ```
-请求 → L1 内存缓存 → L2 Redis 缓存 → 实际 SDK 调用 → 外部 API
+panel.code 执行 → SDK 调用 → L1 内存缓存 → L2 Redis 缓存 → 实际外部 API
 ```
+
+缓存发生在 SDK adapter 层，对 panel.code 透明：
 
 ```go
 type CachedAdapterRegistry struct {
     adapters  *AdapterRegistry
-    l1Cache   *lru.Cache[string, cacheEntry]  // 进程内 LRU
-    redis     *redis.Client                    // Redis
-    specStore *Registry                        // 用于读取 cacheTTL
+    l1Cache   *lru.Cache[string, cacheEntry]
+    redis     *redis.Client
+    specStore *Registry
 }
 
 type cacheEntry struct {
@@ -203,7 +259,6 @@ func (c *CachedAdapterRegistry) Call(ctx context.Context, source, method string,
 }
 
 func (c *CachedAdapterRegistry) buildCacheKey(source, method string, params map[string]interface{}) string {
-    // 参数排序后序列化，保证相同参数命中同一缓存
     keys := make([]string, 0, len(params))
     for k := range params {
         keys = append(keys, k)
@@ -229,7 +284,7 @@ func (c *CachedAdapterRegistry) getTTL(source, method string) time.Duration {
             return d
         }
     }
-    return time.Minute // 默认 1 分钟
+    return time.Minute
 }
 ```
 
@@ -250,7 +305,7 @@ func (c *CachedAdapterRegistry) getTTL(source, method string) time.Duration {
 
 ### 请求去重
 
-同一时刻多个 panel 可能请求相同数据（如多个 panel 都用 XAUUSD 日线）：
+同一时刻多个 panel.code 可能调用相同 SDK 方法（如多个 panel 都查 XAUUSD 日线）：
 
 ```go
 type RequestDeduper struct {
@@ -296,7 +351,7 @@ func NewRateLimiter(registry *Registry) *RateLimiter {
     for name, spec := range registry.sources {
         if spec.RateLimit != nil {
             rps := float64(spec.RateLimit.RequestsPerMinute) / 60.0
-            rl.limiters[name] = rate.NewLimiter(rate.Limit(rps), spec.RateLimit.RequestsPerMinute/6) // burst = 10s worth
+            rl.limiters[name] = rate.NewLimiter(rate.Limit(rps), spec.RateLimit.RequestsPerMinute/6)
         }
     }
     return rl
